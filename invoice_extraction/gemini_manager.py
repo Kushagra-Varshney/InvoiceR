@@ -7,10 +7,11 @@ Uses langchain-google-genai under the hood.
 import os
 from dataclasses import dataclass
 
-from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+import invoice_extraction.config  # noqa: F401 — ensures load_dotenv() runs
 
-load_dotenv()
+from .logging_config import get_logger
+
+logger = get_logger("gemini")
 
 RECOMMENDED_MODELS = [
     "gemini-3-flash-preview",
@@ -19,9 +20,9 @@ RECOMMENDED_MODELS = [
 
 @dataclass
 class GeminiStatus:
-    connected:        bool
-    available_models: list
-    error:            str = ""
+    connected: bool
+    available_models: list[str]
+    error: str = ""
 
 
 class GeminiManager:
@@ -44,27 +45,19 @@ class GeminiManager:
                 error="No API key provided",
             )
 
-        try:
-            # Validate key with a lightweight test call via LangChain
-            llm = ChatGoogleGenerativeAI(
-                model=RECOMMENDED_MODELS[0],
-                api_key=self.api_key,
-                temperature=0,
-                max_tokens=1,
-            )
-            llm.invoke("hi")  # minimal call just to validate the key
+        # Trust the key without making a test LLM call — the actual extraction
+        # will surface auth errors if the key is invalid.
+        logger.info(f"API key accepted (source: {self.key_source})")
+        return GeminiStatus(
+            connected=True,
+            available_models=RECOMMENDED_MODELS,
+        )
 
-            return GeminiStatus(
-                connected=True,
-                available_models=RECOMMENDED_MODELS,
-            )
-
-        except Exception as e:
-            return GeminiStatus(
-                connected=False,
-                available_models=[],
-                error=str(e),
-            )
+    def _sanitize_error(self, error: str) -> str:
+        """Remove API key from error messages to prevent leakage."""
+        if self.api_key and self.api_key in error:
+            return error.replace(self.api_key, "***")
+        return error
 
     @property
     def key_source(self) -> str:

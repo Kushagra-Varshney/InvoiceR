@@ -22,28 +22,41 @@ Output shape:
           └── grand_total
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING
+
+from .config import CURRENCY_SYMBOLS
+from .logging_config import get_logger
+
+if TYPE_CHECKING:
+    from .invoice_extractor import ExtractionResult
+    from .schemas import LineItem
+
+logger = get_logger("aggregator")
 
 
 @dataclass
 class ProductRow:
     """One aggregated row in the Excel output — represents a product family."""
+
     product_family: str
-    quantity:       float = 0.0
-    unit_price:     str   = ""     # blank if mixed prices across variants
-    vat:            float = 0.0
-    sub_total:      float = 0.0
-    total:          float = 0.0
+    quantity: float = 0.0
+    unit_price: str = ""  # blank if mixed prices across variants
+    vat: float = 0.0
+    sub_total: float = 0.0
+    total: float = 0.0
 
 
 @dataclass
 class InvoiceSummary:
     """Totals row (green row in the Excel) — sums across all ProductRows."""
+
     total_quantity: float = 0.0
-    total_vat:      float = 0.0
-    sub_total:      float = 0.0
-    grand_total:    float = 0.0
+    total_vat: float = 0.0
+    sub_total: float = 0.0
+    grand_total: float = 0.0
 
 
 @dataclass
@@ -52,21 +65,22 @@ class AggregatedInvoice:
     Full aggregated result for one invoice page.
     Ready to be written directly to Excel.
     """
+
     # ── Invoice metadata ──────────────────────────────────────────────────────
     source_filename: str = ""
-    page_number:     int = 1
-    document_date:   str = ""
+    page_number: int = 1
+    document_date: str = ""
     document_number: str = ""
-    vendor_name:     str = ""
-    client_name:     str = ""
+    vendor_name: str = ""
+    client_name: str = ""
 
     # ── Aggregated data ───────────────────────────────────────────────────────
-    product_rows: list[ProductRow]  = field(default_factory=list)
-    summary:      InvoiceSummary    = field(default_factory=InvoiceSummary)
+    product_rows: list[ProductRow] = field(default_factory=list)
+    summary: InvoiceSummary = field(default_factory=InvoiceSummary)
 
     # ── Validation flag ───────────────────────────────────────────────────────
-    valid:        bool = True
-    warning:      str  = ""   # human-readable reason if valid=False
+    valid: bool = True
+    warning: str = ""  # human-readable reason if valid=False
 
 
 class Aggregator:
@@ -85,7 +99,7 @@ class Aggregator:
       - Any numeric field cannot be parsed as float
     """
 
-    def aggregate(self, result) -> AggregatedInvoice:
+    def aggregate(self, result: ExtractionResult) -> AggregatedInvoice:
         """
         Args:
             result: ExtractionResult from InvoiceExtractor
@@ -94,32 +108,34 @@ class Aggregator:
             AggregatedInvoice ready for Excel export
         """
         inv = AggregatedInvoice(
-            source_filename = result.source_filename,
-            page_number     = result.page_number,
-            document_date   = result.data.document_date   or "",
-            document_number = result.data.document_number or "",
-            vendor_name     = result.data.vendor_name     or "",
-            client_name     = result.data.client_name     or "",
+            source_filename=result.source_filename,
+            page_number=result.page_number,
+            document_date=result.data.document_date or "",
+            document_number=result.data.document_number or "",
+            vendor_name=result.data.vendor_name or "",
+            client_name=result.data.client_name or "",
         )
 
         if not result.success:
-            inv.valid   = False
+            inv.valid = False
             inv.warning = f"Extraction failed: {result.error}"
+            logger.warning(f"[{result.source_filename}] Skipping failed extraction: {result.error}")
             return inv
 
         line_items = result.data.line_items or []
 
         if not line_items:
-            inv.valid   = False
+            inv.valid = False
             inv.warning = "No line items extracted"
+            logger.warning(f"[{result.source_filename}] No line items to aggregate")
             return inv
 
         # ── Group by product_family ───────────────────────────────────────────
-        groups: dict[str, list] = {}
+        groups: dict[str, list[LineItem]] = {}
         for item in line_items:
             family = (item.product_family or "").strip()
             if not family:
-                inv.valid   = False
+                inv.valid = False
                 inv.warning = f"Empty product_family on item: {item.description!r} — sent for manual review"
                 return inv
             groups.setdefault(family, []).append(item)
@@ -128,34 +144,37 @@ class Aggregator:
         for family, items in groups.items():
             row, ok, warn = self._build_product_row(family, items)
             if not ok:
-                inv.valid   = False
+                inv.valid = False
                 inv.warning = warn
                 return inv
             inv.product_rows.append(row)
 
         # ── Build summary ─────────────────────────────────────────────────────
         inv.summary = InvoiceSummary(
-            total_quantity = sum(r.quantity  for r in inv.product_rows),
-            total_vat      = sum(r.vat       for r in inv.product_rows),
-            sub_total      = sum(r.sub_total for r in inv.product_rows),
-            grand_total    = sum(r.total     for r in inv.product_rows),
+            total_quantity=sum(r.quantity for r in inv.product_rows),
+            total_vat=sum(r.vat for r in inv.product_rows),
+            sub_total=sum(r.sub_total for r in inv.product_rows),
+            grand_total=sum(r.total for r in inv.product_rows),
         )
 
+        logger.info(
+            f"[{result.source_filename}] Aggregated {len(line_items)} items into {len(inv.product_rows)} product groups"
+        )
         return inv
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _build_product_row(self, family: str, items: list) -> tuple:
+    def _build_product_row(self, family: str, items: list[LineItem]) -> tuple[ProductRow | None, bool, str]:
         """
         Aggregate a list of LineItems into a single ProductRow.
 
         Returns:
             (ProductRow, success: bool, warning: str)
         """
-        total_qty   = 0.0
-        total_vat   = 0.0
-        total_amt   = 0.0
-        prices      = set()
+        total_qty = 0.0
+        total_vat = 0.0
+        total_amt = 0.0
+        prices = set()
 
         for item in items:
             qty, ok = self._parse_float(item.quantity)
@@ -184,12 +203,12 @@ class Aggregator:
         sub_total = total_amt - total_vat
 
         row = ProductRow(
-            product_family = family,
-            quantity       = total_qty,
-            unit_price     = unit_price,
-            vat            = total_vat,
-            sub_total      = sub_total,
-            total          = total_amt,
+            product_family=family,
+            quantity=total_qty,
+            unit_price=unit_price,
+            vat=total_vat,
+            sub_total=sub_total,
+            total=total_amt,
         )
 
         return row, True, ""
@@ -203,19 +222,15 @@ class Aggregator:
             (float_value, success: bool)
         """
         if not value:
-            return 0.0, True   # empty = treat as zero, not an error
+            return 0.0, True  # empty = treat as zero, not an error
 
-        cleaned = (
-            str(value)
-            .replace(",", "")
-            .replace(" ", "")
-            .replace("R", "")   # South African Rand symbol
-            .replace("$", "")
-            .replace("€", "")
-            .strip()
-        )
+        cleaned = str(value).replace(",", "").replace(" ", "")
+        for sym in CURRENCY_SYMBOLS:
+            cleaned = cleaned.replace(sym, "")
+        cleaned = cleaned.strip()
 
         try:
             return float(cleaned), True
         except ValueError:
+            logger.debug(f"Cannot parse float from value: {value!r}")
             return 0.0, False

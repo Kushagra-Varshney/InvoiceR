@@ -22,49 +22,25 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
-from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from PIL import Image
 from tenacity import (
+    RetryError,
+    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    before_sleep_log,
-    RetryError,
 )
 
-from schemas import InvoiceData
+from .config import ExtractionConfig
+from .logging_config import get_logger
+from .schemas import InvoiceData
 
-load_dotenv()
-
-# ── Logger ────────────────────────────────────────────────────────────────────
-# Writes to invoice_parser.log in the working directory + streams to console.
-# Format: timestamp | level | message
-
-logger = logging.getLogger("invoice_parser")
-
-if not logger.handlers:
-    logger.setLevel(logging.DEBUG)
-
-    # File handler — full debug trace
-    fh = logging.FileHandler("invoice_parser.log", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-
-    # Console handler — info and above only
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%H:%M:%S"))
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
+_EXTRACT = ExtractionConfig()
+logger = get_logger("extractor")
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
@@ -90,6 +66,7 @@ Examples:
 
 
 # ── Standalone functions — usable directly in notebooks ──────────────────────
+
 
 def build_chain(api_key: str = "", model: str = "gemini-2.0-flash"):
     """
@@ -118,7 +95,7 @@ def build_chain(api_key: str = "", model: str = "gemini-2.0-flash"):
     llm = ChatGoogleGenerativeAI(
         model=model,
         api_key=resolved_key,
-        temperature=0,
+        temperature=_EXTRACT.TEMPERATURE,
     )
 
     # with_structured_output enforces the Pydantic schema at the API level
@@ -127,11 +104,15 @@ def build_chain(api_key: str = "", model: str = "gemini-2.0-flash"):
 
 
 @retry(
-    retry    = retry_if_exception_type(Exception),
-    stop     = stop_after_attempt(5),
-    wait     = wait_exponential(multiplier=1, min=2, max=30),
-    before_sleep = before_sleep_log(logger, logging.WARNING),
-    reraise  = True,
+    retry=retry_if_exception_type(Exception),
+    stop=stop_after_attempt(_EXTRACT.MAX_RETRIES),
+    wait=wait_exponential(
+        multiplier=_EXTRACT.RETRY_MULTIPLIER,
+        min=_EXTRACT.RETRY_MIN_WAIT,
+        max=_EXTRACT.RETRY_MAX_WAIT,
+    ),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
 )
 def _invoke_chain_with_retry(chain, message: HumanMessage) -> InvoiceData:
     """Raw chain call — called by extract_from_image, wrapped with tenacity retry."""
@@ -161,25 +142,27 @@ def extract_from_image(chain, image_bytes: bytes, label: str = "") -> InvoiceDat
     logger.info(f"[{tag}] Starting extraction")
     start = time.time()
 
-    b64     = _image_to_base64(image_bytes)
-    message = HumanMessage(content=[
-        {"type": "text",      "text":      SYSTEM_PROMPT},
-        {"type": "image_url", "image_url": f"data:image/jpeg;base64,{b64}"},
-    ])
+    b64 = _image_to_base64(image_bytes)
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": SYSTEM_PROMPT},
+            {"type": "image_url", "image_url": f"data:image/jpeg;base64,{b64}"},
+        ]
+    )
 
     try:
-        result  = _invoke_chain_with_retry(chain, message)
+        result = _invoke_chain_with_retry(chain, message)
         elapsed = time.time() - start
         n_items = len(result.line_items) if result.line_items else 0
-        logger.info(f"[{tag}] ✅ Extracted {n_items} line items in {elapsed:.1f}s")
+        logger.info(f"[{tag}] Extracted {n_items} line items in {elapsed:.1f}s")
         return result
-    except RetryError as e:
+    except RetryError:
         elapsed = time.time() - start
-        logger.error(f"[{tag}] ❌ All 5 retries exhausted after {elapsed:.1f}s")
+        logger.error(f"[{tag}] All {_EXTRACT.MAX_RETRIES} retries exhausted after {elapsed:.1f}s")
         raise
     except Exception as e:
         elapsed = time.time() - start
-        logger.error(f"[{tag}] ❌ Failed after {elapsed:.1f}s — {e}")
+        logger.error(f"[{tag}] Failed after {elapsed:.1f}s: {e}")
         raise
 
 
@@ -201,11 +184,12 @@ def extract_from_file(file_path: str, api_key: str = "", model: str = "gemini-2.
         print(data.total)
     """
     image_bytes = _load_file_as_image(file_path)
-    chain       = build_chain(api_key=api_key, model=model)
+    chain = build_chain(api_key=api_key, model=model)
     return extract_from_image(chain, image_bytes)
 
 
 # ── InvoiceExtractor class — used by the Streamlit pipeline ──────────────────
+
 
 @dataclass
 class ExtractionResult:
@@ -213,11 +197,12 @@ class ExtractionResult:
     Wraps InvoiceData with pipeline metadata.
     Used by the Streamlit app to track per-page status, errors, and display names.
     """
+
     source_filename: str
-    page_number:     int
-    success:         bool
-    data:            InvoiceData = field(default_factory=InvoiceData)
-    error:           str         = ""
+    page_number: int
+    success: bool
+    data: InvoiceData = field(default_factory=InvoiceData)
+    error: str = ""
 
     @property
     def display_name(self) -> str:
@@ -259,7 +244,7 @@ class InvoiceExtractor:
         Returns:
             ExtractionResult with validated InvoiceData or error details
         """
-        label  = f"{filename} pg.{page_number}"
+        label = f"{filename} pg.{page_number}"
         result = ExtractionResult(
             source_filename=filename,
             page_number=page_number,
@@ -269,10 +254,12 @@ class InvoiceExtractor:
         logger.debug(f"[{label}] Queuing extraction")
 
         try:
-            invoice_data   = extract_from_image(self.chain, image_bytes, label=label)
-            result.data    = invoice_data
+            invoice_data = extract_from_image(self.chain, image_bytes, label=label)
+            result.data = invoice_data
             result.success = True
-            logger.debug(f"[{label}] Saved to result — vendor: {invoice_data.vendor_name!r}, total: {invoice_data.total!r}")
+            logger.debug(
+                f"[{label}] Saved to result — vendor: {invoice_data.vendor_name!r}, total: {invoice_data.total!r}"
+            )
 
         except Exception as e:
             result.error = str(e)
@@ -283,17 +270,19 @@ class InvoiceExtractor:
 
 # ── Private helpers ───────────────────────────────────────────────────────────
 
+
 def _image_to_base64(image_bytes: bytes) -> str:
     """Convert raw image bytes to base64 JPEG string."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=92)
+    img.save(buf, format="JPEG", quality=_EXTRACT.JPEG_QUALITY)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def _load_file_as_image(file_path: str) -> bytes:
     """Load a PNG/JPG/PDF file and return raw image bytes. PDFs use first page."""
     from pathlib import Path
+
     path = Path(file_path)
 
     if not path.exists():
@@ -301,9 +290,13 @@ def _load_file_as_image(file_path: str) -> bytes:
 
     if path.suffix.lower() == ".pdf":
         import fitz
-        pdf    = fitz.open(str(path))
-        page   = pdf[0]
-        matrix = fitz.Matrix(200 / 72, 200 / 72)
+
+        pdf = fitz.open(str(path))
+        page = pdf[0]
+        from .config import PDFConfig
+
+        scale = PDFConfig.DPI / PDFConfig.BASE_DPI
+        matrix = fitz.Matrix(scale, scale)
         pixmap = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB)
         pdf.close()
         return pixmap.tobytes("png")

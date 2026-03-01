@@ -25,6 +25,18 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.tiff
+*.ico
+*.zip
+*.tar.gz
+*.tar.bz2
+*.tar.xz
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
